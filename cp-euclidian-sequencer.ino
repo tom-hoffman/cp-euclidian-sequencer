@@ -1,4 +1,4 @@
-// Circuit Playground Euclidian MIDI Sequencer (non-rotating)
+// Circuit Playground Euclidian MIDI Sequencer
 // By Tom Hoffman
 // GPL 3.0 License.
 
@@ -22,17 +22,11 @@
 // All steps: blue.
 // Active step: green.
 
-// Seems to work without lag up to about 1600 bmp (as indicated by 
-// the reported clock rate), based on obvious lag when clock is switched off.
-// This is not serious benchmarking at this point.
-
 // TODO:
+// Change to USB-MIDI.h (for consistency)
 
 #include <Adafruit_CircuitPlayground.h>
-#include <USB-MIDI.h>
-
-USBMIDI_CREATE_DEFAULT_INSTANCE();
-using namespace MIDI_NAMESPACE;
+#include <MIDIUSB.h>
 
 // CONSTANTS
 const uint8_t   LED_COUNT         = 10;
@@ -42,7 +36,7 @@ const uint8_t   NOTE_COUNT        = 4;
 const uint8_t   NOTES[4]          = {36, 38, 59, 47}; // selection of MIDI note values
 const uint16_t  CAP_THRESHOLD     = 1000;
 const uint16_t  CAP_DEBOUNCE      = 1000;
-const uint8_t   OUT_CHANNEL       = 1;    // 1 - 16 set for your synth
+const uint8_t   OUT_CHANNEL       = 0;    // 0 - 15 set for your synth
 
 
 
@@ -50,8 +44,7 @@ const uint8_t   OUT_CHANNEL       = 1;    // 1 - 16 set for your synth
 
 uint8_t   steps                   = 2;    // steps in sequence
 uint8_t   triggers                = 0;    // number of played notes in sequence
-uint16_t  active_step             = 0b1;  // active step as bitmask
-uint16_t  first_step              = 0b1;  // the first beat in the sequence as bitmask
+
 uint8_t   note                    = 0;    // index of NOTES
 uint8_t   pitch;                          // MIDI note table value
 uint16_t  sequence;                       // sequence as a binary number
@@ -63,7 +56,13 @@ bool      a_button_down           = false;
 bool      b_button_down           = false;
 bool      switch_is_right;
 bool      red_led                 = false;
-bool      started                 = false;
+
+
+void noteOn(byte c, byte p, byte v) {
+  // The Nord Drum 1 doesn't care about note off messages.
+  midiEventPacket_t noteOn = {0x09, 0x90 | c, p, v};
+  MidiUSB.sendMIDI(noteOn);
+}
 
 uint16_t rotateRight(uint16_t n) {
   // Rotating bit shift to right.
@@ -112,9 +111,9 @@ uint16_t generateEuclidian(uint16_t triggers, float steps) {
   return pattern;
 }
 
-uint8_t getRed(int pix) {
-  if (bitRead(active_step, pix)) {
-    return 64;  
+uint8_t getRed(int b) {
+  if (b == 0) {
+    return 16;  
   }
   else {
     return 0;
@@ -123,7 +122,7 @@ uint8_t getRed(int pix) {
 
 uint8_t getGreen(int pix) {
   if (bitRead(sequence, pix)) {
-    return 48; //velocity;
+    return 128; //velocity;
   }
   else {
     return 0;
@@ -141,7 +140,7 @@ uint8_t getBlue(int pix) {
 }
 
 void updateSequencePixel(int pix) {
-  CircuitPlayground.setPixelColor((pix), getRed(pix), 
+  CircuitPlayground.setPixelColor((9 - pix), getRed(pix), 
                                        getGreen(pix), 
                                        getBlue(pix));
 }
@@ -213,7 +212,6 @@ void addStep() {
   }
   else {            // wrap
     steps = 1;
-    active_step = 0b1;
     if (triggers) {   // if there are any triggers
       triggers = 1;   // reduce to one
     }
@@ -229,12 +227,24 @@ void addTrigger() {
   }
 }
 
+void checkCapTouch() {
+  long m = millis();
+  if (m - last_cap_touch > CAP_DEBOUNCE) {
+    if (CircuitPlayground.readCap(6) > CAP_THRESHOLD) {
+      sequence = rotateRight(sequence);
+      last_cap_touch = m;
+    }
+  }
+}
+
 void advanceSequence() {
+  checkCapTouch();
   CircuitPlayground.redLED(red_led);
   red_led = !red_led;
-  active_step = rotateRight(active_step);
-  if (active_step & sequence) {
-    MIDI.sendNoteOn(pitch, velocity, OUT_CHANNEL);
+  sequence = rotateRight(sequence);
+  if bitRead(sequence, 0) {
+    noteOn(OUT_CHANNEL, pitch, velocity);
+    MidiUSB.flush();
   }
   if (switch_is_right) {
     updateSequenceDisplay();
@@ -248,15 +258,9 @@ void advanceNote() {
 
 void processLeftButton() {
   if (switchRight()) {
-    if (started) {
-      addStep();
-      sequence = generateEuclidian(triggers, steps);
-    } 
-    else { // if stopped, decrement first_step
-      first_step = rotateLeft(active_step);
-      active_step = first_step;
-    }
-  updateSequenceDisplay();
+    addStep();
+    sequence = generateEuclidian(triggers, steps);
+    updateSequenceDisplay();
   }
   else {
     advanceNote();
@@ -271,15 +275,9 @@ void increaseVelocity() {
 
 void processRightButton() {
   if (switchRight()) {
-    if (started) {
-      addTrigger();
-      sequence = generateEuclidian(triggers, steps);
-    }
-    else { // if stopped, advance first_step
-      first_step = rotateRight(active_step);
-      active_step = first_step;
-    }
-  updateSequenceDisplay();
+    addTrigger();
+    sequence = generateEuclidian(triggers, steps);
+    updateSequenceDisplay();
   }
   else {
     increaseVelocity();
@@ -289,43 +287,31 @@ void processRightButton() {
   }
 }
 
+void checkMIDI() {
+  midiEventPacket_t rx;
+  do {
+    rx = MidiUSB.read();
+    //Count pulses and send note 
+    if(rx.byte1 == 0xF8){
+      pulse_count++;
+      if(pulse_count >= 24){
+        advanceSequence();
+      };
+    }
+    //Clock start byte
+    else if ((rx.byte1 == 0xFA) || (rx.byte1 == 0xFC)){
+      red_led = false;
+      pulse_count = 0;
+    }
+  } while (rx.header != 0);
+}
+
 bool switchChanged() {
   return (switch_is_right != switchRight()); 
 }
 
-void onClock() {
-  if (started) {
-    pulse_count++;
-    if (pulse_count >= 24) {
-      advanceSequence();
-    }
-  }
-}
-
-void onStart() {
-  onContinue();
-  active_step = first_step;
-}
-
-void onContinue() {
-  started = true;
-  red_led = false;
-  pulse_count = 0;
-}
-
-void onStop() {
-  started = false;
-  active_step = first_step;
-  updateSequenceDisplay();
-}
-
 void setup() {
   CircuitPlayground.begin();
-  MIDI.begin(OUT_CHANNEL);
-  MIDI.setHandleClock(onClock);
-  MIDI.setHandleStart(onStart);
-  MIDI.setHandleContinue(onContinue);
-  MIDI.setHandleStop(onStop);
   sequence = generateEuclidian(triggers, steps);
   velocity = calculateVelocity();
   switch_is_right = switchRight();
@@ -337,11 +323,11 @@ void setup() {
 }
 
 void loop() {
-  MIDI.read();
   if (switchChanged()) {
     switch_is_right = switchRight();
     updateNeoPixels();
   }
+  checkMIDI();
   if (!a_button_down) {                   // if a not previously pressed
     if (CircuitPlayground.leftButton()) { // and the button is being pressed
       processLeftButton();              // process new press
